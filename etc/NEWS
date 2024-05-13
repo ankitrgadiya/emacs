@@ -1389,6 +1389,22 @@ This command adds a docstring comment to the current defun.  If a
 comment already exists, point is only moved to the comment.  It is
 bound to 'C-c C-d' in 'go-ts-mode'.
 
+*** New unit test commands.
+Two new commands are now available to run unit tests.
+
+The 'go-ts-mode-test-function-at-point' command runs the unit test at
+point.  If a region is active, it runs all the unit tests under the
+region.  It is bound to 'C-c C-t t' in 'go-ts-mode'.
+
+The 'go-ts-mode-test-file' command runs all unit tests in the current
+file. It is bound to 'C-c C-t f' in 'go-ts-mode'.
+
+The 'go-ts-mode-test-package' command runs all unit tests under the
+package of the current buffer.  It is bound to 'C-c C-t p' in 'go-ts-mode'.
+
+The 'go-ts-mode-build-tags' variable is available to set a list of build
+tags for the test commands.
+
 ** Man mode
 
 +++
