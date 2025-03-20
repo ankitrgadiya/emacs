@@ -81,6 +81,32 @@
   :type '(repeat string)
   :group 'go)
 
+(defface go-ts-mode-test-covered
+  `((((class color) (background light))
+     ,@(and (>= emacs-major-version 27) '(:extend t))
+     :background "#ddffdd"
+     :foreground "#22aa22")
+    (((class color) (background dark))
+     ,@(and (>= emacs-major-version 27) '(:extend t))
+     :background "#335533"
+     :foreground "#ddffdd"))
+  "Face for lines covered by the tests."
+  :version "31.1"
+  :group 'go)
+
+(defface go-ts-mode-test-not-covered
+  `((((class color) (background light))
+     ,@(and (>= emacs-major-version 27) '(:extend t))
+     :background "#ffdddd"
+     :foreground "#aa2222")
+    (((class color) (background dark))
+     ,@(and (>= emacs-major-version 27) '(:extend t))
+     :background "#553333"
+     :foreground "#ffdddd"))
+  "Face for lines not covered by the tests."
+  :version "31.1"
+  :group 'go)
+
 (defvar go-ts-mode--syntax-table
   (let ((table (make-syntax-table)))
     (modify-syntax-entry ?+   "."      table)
@@ -269,13 +295,45 @@
    :override t
    '((ERROR) @font-lock-warning-face)))
 
+(defvar go-ts-mode--coverage-regexp
+  (rx (and line-start
+           ;; Prefix of the Package.
+	   (zero-or-more (zero-or-more nonl) "/")
+           ;; Capture: Name of the File.
+	   (group (one-or-more (zero-or-more nonl) ".go"))
+	   ":"
+           ;; Capture: Start Line
+	   (group (one-or-more digit))
+	   "."
+           ;; Capture: Start Column
+	   (group (one-or-more digit))
+	   ","
+           ;; Capture: End Line
+	   (group (one-or-more digit))
+	   "."
+           ;; Capture: End Column
+	   (group (one-or-more digit))
+	   " "
+           ;; Capture: Line Count
+	   (group (one-or-more digit))
+	   " "
+           ;; Capture: Coverage Count
+	   (group (one-or-more digit))
+	   line-end))
+  "Regular expression for test coverage profile.")
+
+(defvar go-ts-mode--test-coverage-overlay-property
+  'go-coverage
+  "Property for the overlay to identify coverage overlays.")
+
 (defvar-keymap go-ts-mode-map
   :doc "Keymap used in Go mode, powered by tree-sitter"
   :parent prog-mode-map
   "C-c C-d" #'go-ts-mode-docstring
   "C-c C-t t" #'go-ts-mode-test-function-at-point
   "C-c C-t f" #'go-ts-mode-test-this-file
-  "C-c C-t p" #'go-ts-mode-test-this-package)
+  "C-c C-t p" #'go-ts-mode-test-this-package
+  "C-c C-t d" #'go-ts-mode-test-remove-overlays)
 
 ;;;###autoload
 (define-derived-mode go-ts-mode prog-mode "Go"
@@ -458,14 +516,24 @@ specifying build tags."
       (mapconcat #'shell-quote-argument go-ts-mode-test-flags " ")
     ""))
 
-(defun go-ts-mode--compile-test (regexp)
+(defun go-ts-mode--get-coverage-flag (coverage-file)
+  "Return the compile flag for coverage profile."
+  (if (not (null coverage-file))
+      (format "-coverprofile %s" coverage-file)
+    ""))
+
+(defun go-ts-mode--compile-test (regexp &optional coverage-file)
   "Compile the tests matching REGEXP.
 This function respects the `go-ts-mode-build-tags' variable for
 specifying build tags."
-  (compile (format "go test -v %s -run '%s' %s"
-                   (go-ts-mode--get-build-tags-flag)
-                   regexp
-                   (go-ts-mode--get-test-flags))))
+  (let ((cmd (format "go test -v %s %s -run '%s'"
+                     (go-ts-mode--get-coverage-flag coverage-file)
+                     (go-ts-mode--get-build-tags-flag)
+                     regexp
+                     (go-ts-mode--get-test-flags))))
+    (if coverage-file
+        (shell-command cmd)
+      (compile cmd))))
 
 (defun go-ts-mode--find-defun-at (start)
   "Return the first defun node from START."
@@ -506,20 +574,108 @@ region."
       (string-join funcs "|")
     (error "No test function found")))
 
-(defun go-ts-mode-test-function-at-point ()
+(defun go-ts-mode--read-coverage (coverage-file)
+  "Parses the COVERAGE-FILE into an alist.
+The file is parsed using the `go-ts-mode--coverage-regexp'. It maps the
+filenames to a list of plist with coverage information."
+  (let ((coverage-data '())
+        (current-file nil)
+        (current-file-lines nil))
+    (with-temp-buffer
+      (insert-file-contents coverage-file)
+      (goto-char (point-min))
+      (while (re-search-forward go-ts-mode--coverage-regexp nil t)
+        (let ((filename (match-string 1)))
+          (when (or (null current-file)
+                    (not (string= current-file filename)))
+            (push (cons current-file (nreverse current-file-lines))
+                  coverage-data)
+            (setq current-file filename
+                  current-file-lines nil))
+          (push `(start-line ,(string-to-number (match-string 2))
+                  start-column ,(string-to-number (match-string 3))
+                  end-line ,(string-to-number (match-string 4))
+                  end-column ,(string-to-number (match-string 5))
+                  lines ,(string-to-number (match-string 6))
+                  covered ,(string-to-number (match-string 7)))
+                current-file-lines)))
+      (push (cons current-file (nreverse current-file-lines))
+            coverage-data))
+    coverage-data))
+
+(defun go-ts-mode--make-coverage-overlay (start end covered)
+  "Returns an overlay with the test coverage faces from START to END."
+  (let ((ov (make-overlay start end))
+        (face (if (and (numberp covered)
+                       (> covered 0))
+                  'go-ts-mode-test-covered
+                'go-ts-mode-test-not-covered)))
+    (overlay-put ov 'face face)
+    (overlay-put ov 'go-ts-mode--test-coverage-overlay-property t)
+    ov))
+
+(defun go-ts-mode--apply-coverage-overlay (elem)
+  "Applies test coverage overlays for the given element."
+  (go-ts-mode-test-remove-overlays)
+  (when-let* ((filename (car elem))
+              (buffer (find-buffer-visiting filename)))
+    (save-excursion
+      (set-buffer buffer)
+      (goto-char (point-min))
+      (mapcar
+       (lambda (cover)
+         (let ((start-line (plist-get cover 'start-line))
+               (end-line (plist-get cover 'end-line))
+               (start nil)
+               (end nil))
+           (goto-char (point-min))
+           (forward-line (1- (plist-get cover 'start-line)))
+           (move-to-column (plist-get cover 'start-column))
+           (setq start (point))
+           (forward-line (- end-line start-line))
+           (move-to-column (plist-get cover 'end-column))
+           (go-ts-mode--make-coverage-overlay start
+                                              (point)
+                                              (plist-get cover 'covered))))
+       (cdr elem)))))
+
+(defun go-ts-mode-test-remove-overlays ()
+  "Removes coverage overlays in the buffer."
+  (interactive)
+  (mapc (lambda (ov)
+          (when (overlay-get ov 'go-ts-mode--test-coverage-overlay-property)
+            (delete-overlay ov)))
+        (overlays-in (point-min)
+                     (point-max))))
+
+(defun go-ts-mode-test-function-at-point (&optional arg)
   "Run the unit test at point.
 If the point is anywhere in the test function, that function will be
 run.  If the region is selected, all the functions under the region will
 be run."
-  (interactive)
-  (go-ts-mode--compile-test (go-ts-mode--get-test-regexp-at-point)))
+  (interactive "P")
+  (let ((coverage-file (if (not (null arg))
+                           (make-temp-file "coverage")
+                         nil)))
+    (go-ts-mode--compile-test (go-ts-mode--get-test-regexp-at-point)
+                              coverage-file)
+    (when coverage-file
+      (mapc #'go-ts-mode--apply-coverage-overlay
+            (go-ts-mode--read-coverage coverage-file)))))
 
-(defun go-ts-mode-test-this-file ()
+(defun go-ts-mode-test-this-file (&optional arg)
   "Run all the unit tests in the current file."
-  (interactive)
-  (if-let* ((defuns (go-ts-mode--get-functions-in-range (point-min) (point-max))))
-      (go-ts-mode--compile-test (string-join defuns "|"))
-    (error "No test functions found in the current file")))
+  (interactive "P")
+  (let ((coverage-file (if (not (null arg))
+                           (make-temp-file "coverage")
+                         nil)))
+    (if-let* ((defuns (go-ts-mode--get-functions-in-range (point-min) (point-max))))
+        (go-ts-mode--compile-test (string-join defuns "|")
+                                  coverage-file)
+      (error "No test functions found in the current file"))
+    (when coverage-file
+      (mapc #'go-ts-mode--apply-coverage-overlay
+            (go-ts-mode--read-coverage coverage-file)))))
 
 (defun go-ts-mode-test-this-package ()
   "Run all the unit tests under the current package."
