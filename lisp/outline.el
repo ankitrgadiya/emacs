@@ -552,6 +552,10 @@ outline font-lock faces to those of major mode."
             (overlay-put overlay 'face (outline-font-lock-face))))
         (goto-char (match-end 0))))))
 
+(defun outline-imenu-extract-index-name ()
+  "Extract the `imenu' index name for the Outline heading at point."
+  (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
+
 ;;;###autoload
 (define-minor-mode outline-minor-mode
   "Toggle Outline minor mode.
@@ -606,7 +610,9 @@ See the command `outline-mode' for more information on this mode."
 		  nil t)
         (add-hook 'revert-buffer-restore-functions
                   #'outline-revert-buffer-restore-visibility nil t)
-        (setq-local line-move-ignore-invisible t)
+        (setq-local line-move-ignore-invisible t
+                    imenu-extract-index-name-function #'outline-imenu-extract-index-name
+                    imenu-prev-index-position-function #'outline-previous-heading)
 	;; Cause use of ellipses for invisible text.
 	(add-to-invisibility-spec '(outline . t))
 	(outline-apply-default-state))
